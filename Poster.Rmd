@@ -1,0 +1,605 @@
+---
+title: "Poster"
+author: "Alexander Kirchmair"
+---
+
+# Analysis and figures for the metabolomics poster 2022
+
+```{r setup, include=FALSE}
+
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(openxlsx)
+library(patchwork)
+library(fgsea)
+library(ggpubr)
+library(DESeq2)
+
+library(datamisc)
+library(c13ms)
+library(metabolicnetworks)
+
+source("../CD8/analysis/lib/rnaseq.R")
+
+if (!dir.exists("results")) dir.create("results")
+
+```
+
+
+Colors/Parameters/Functions
+```{r}
+
+colors <- list()
+colors$celltype <- c(TN = "#0DA5CA", TSCM = "#25DA3A", TCM = "#CC9511", TEM ="#CA3613", TEFF = "#CF151C", TEX = "#C2CB21")
+
+
+ggsea_bar <- function(res, signif = NULL, arrange_by = "score", max = 50, min_up = 5, min_down = 5, title = NULL, labsize = 3){
+  
+  ggdf <- res
+  ggdf$score <- -log10(ggdf$padj) * sign(ggdf$NES)
+  ggdf$score1 <- -log10(ggdf$pval) * sign(ggdf$NES)
+  
+  
+  if (!is.null(signif)){
+    ggdf <- subset(ggdf, padj <= signif)
+  }
+  
+  ggdf <- ggdf[order(abs(ggdf$score1), decreasing = TRUE),,drop = FALSE]
+  
+  
+  if (is.null(min_up) & is.null(min_down)){
+    ggdf <- ggdf[1:min(max, nrow(ggdf)),, drop = FALSE]
+    
+  } else {
+    ggdf_up <- subset(ggdf, NES > 0)
+    ggdf_down <- subset(ggdf, NES < 0)
+    ggdf_up <- ggdf_up[1:min_up,,drop = FALSE]
+    ggdf_down <- ggdf_down[1:min_down,,drop = FALSE]
+    
+    kdf <- rbind(ggdf_up, ggdf_down)
+    
+    keep <- kdf$pathway
+    add <- subset(ggdf, !pathway %in% keep)
+    
+    n <- max - nrow(kdf)
+    if (n > 0){
+      ggdf <- rbind(kdf, add[1:n,,drop = FALSE])
+    } else {
+      ggdf <- kdf
+    }
+    
+  }
+  
+  ggdf <- ggdf[order(ggdf[[arrange_by]], decreasing = FALSE),,drop = FALSE]
+  
+  ggdf$pathway <- factor(ggdf$pathway, ordered = TRUE, levels = unique(ggdf$pathway))
+  
+  lims <- ceiling(abs(range(ggdf$score)))
+  
+  gg <- ggplot2::ggplot(data = ggdf, mapping = ggplot2::aes(score, pathway, label = pathway, fill = NES)) +
+    theme(axis.text.y = element_blank(), plot.background = element_blank(), axis.ticks.y = element_blank(), plot.title = element_text(hjust = 0.5)) +
+    ggplot2::xlab("+/-log padj") + ggplot2::ylab("") +
+    scale_fill_gradientn(colours = c("blue", "grey95", "red"), breaks = c(-2,-1,0,1,2), limits = c(-3,3), oob = scales::squish) +
+    xlim(c(-max(abs(lims)), max(abs(lims)))) +
+    coord_cartesian(clip = "off")
+  
+  
+  
+  gg <- gg + ggplot2::geom_bar(stat = "identity")
+  
+  if (nrow(subset(ggdf, score < 0)) > 0)  gg <- gg + ggplot2::geom_text(mapping = aes(x = score), size = labsize, data = subset(ggdf, score < 0), nudge_x = 0.25, hjust = 0)
+  if (nrow(subset(ggdf, score > 0)) > 0)  gg <- gg + ggplot2::geom_text(mapping = aes(x = score), size = labsize, data = subset(ggdf, score > 0), nudge_x = -0.25, hjust = 1)
+  
+  if (!is.null(title)){
+    gg <- gg + ggplot2::ggtitle(title)
+  }
+  
+  gg
+}
+
+
+ggstat <- function (data, mapping, type = sd, color = NULL, barwidth = 0.1, boxplot = FALSE, signif = FALSE, signif_text = NULL, ...){
+    data <- data.frame(data)
+    x <- mapping[["x"]]
+    y <- mapping[["y"]]
+    group_by <- mapping[["colour"]] # additional sub-grouping
+    type <- rlang::enquo(type)
+    color <- rlang::enquo(color)
+    
+    statsdf <- subset(data, !is.na(rlang::as_name(x)) & !is.na(rlang::as_name(y))) %>% 
+        group_by(!!group_by, !!x) %>% summarize(mean = mean(!!y, 
+        na.rm = TRUE), var = var(!!y, na.rm = TRUE), sd = sd(!!y, 
+        na.rm = TRUE), n = n())
+    statsdf %<>% mutate(se = sqrt(var/n))
+    statsdf %<>% mutate(ymin = mean - !!type, ymax = mean + !!type)
+    
+    ggs <- ggplot2::ggplot(data = statsdf, mapping = aes(x = !!x, y = mean, colour = !!group_by)) +
+      ylab(rlang::as_name(y))
+    
+    
+    if (boxplot == FALSE){
+      ggs <- ggs + geom_errorbar(aes(ymin = ymin, max = ymax, colour = !!color), width = barwidth, ...)
+      
+    getbw <- function(ggs, barwidth) {
+        diff(datamisc:::gg_getLimits(ggs)$x) * barwidth
+    }
+    
+    ggs$layers[[which(datamisc:::gg_getGeoms(ggs) == "GeomErrorbar")]]$geom_params$width <- getbw(ggs, 
+        barwidth)
+      
+      
+    } else {
+      ggs <- ggs + geom_boxplot(data = data, mapping = aes(x = !!x, y = !!y, colour = !!color), width = barwidth, ...)
+    }
+
+    ggs <- ggs + ggplot2::geom_point(data = data, mapping = mapping)
+    
+    
+    if (signif == TRUE){
+      
+      sigdf <- data.frame(xlevels = unique(data[[rlang::as_name(x)]]),
+                          xx = seq(unique(data[[rlang::as_name(x)]])))
+      sigdf$group1 <- sigdf$xlevels
+      sigdf$group2 <- c(sigdf$xlevels[-1], NA)
+      sigdf <- sigdf[-nrow(sigdf),]
+      
+      sigdf$ymax <- sapply(sigdf$xx, function(xi){
+        ytmp <- subset(data, data[[rlang::as_name(x)]] %in% c(sigdf$xlevels[xi], sigdf$xlevels[xi+1]))[[rlang::as_name(y)]]
+        c(0.9 * max(ytmp) + 0.1 * mean(ytmp))
+      })
+      sigdf$ymax <- sigdf$ymax * 1.5
+      ggs <- ggs + geom_segment(data = sigdf, mapping = aes(x = xx, xend = xx+1, y = ymax, yend = ymax))
+      
+      if (!is.null(signif_text)){
+        sigdf$label <- signif_text
+        ggs <- ggs + geom_text(data = sigdf, mapping = aes(x = xx + 0.5, y = ymax + 0.1, label = label))
+        
+      }
+
+      
+    }
+    
+  
+    ggs
+}
+
+
+
+save_isoplot <- function(gg, file = "isoplot.png", dev = "png", height = 7, dpi = 300, ...){
+  saveplot(p = gg, file = file, dev = dev, units = "in", dpi = dpi, width = get_dims(gg, height = height, dpi = dpi), height = height, ...)
+}
+
+theme_circles2 <- function (base_size = 40, base_family = "", base_line_size = base_size/20, base_rect_size = base_size/80) 
+{
+    th1 <- ggplot2::theme_minimal(base_size = base_size, base_family = base_family, 
+        base_line_size = base_line_size)
+    th2 <- ggplot2::theme(panel.spacing = grid::unit(c(0, 0, 0, 0), units = "mm"),
+                          plot.margin = grid::unit(c(0.01, 0.01, 0.05, 0.01), "npc"),
+        plot.title = ggplot2::element_text(size = base_size, 
+        color = rgb(0, 0, 0), face = "bold", angle = 0, hjust = 0.5, 
+        vjust = 1, margin = ggplot2::margin(c(5, 5, 5, 5), unit = "pt")), 
+        axis.title = ggplot2::element_blank(), axis.text = ggplot2::element_text(margin = ggplot2::margin(c(0, 
+            0, 0, 0)), color = rgb(0, 0, 0), size = ggplot2::rel(1)), 
+        axis.text.x = ggplot2::element_text(size = base_size, 
+            hjust = 0.5, vjust = 1), axis.text.y.left = ggplot2::element_text(size = base_size, 
+            hjust = 1, vjust = 0.5), axis.text.y.right = ggplot2::element_text(colour = NA, 
+            size = base_size, hjust = 1, vjust = 0.5), panel.grid.major = ggplot2::element_blank(), 
+        panel.grid.minor = ggplot2::element_blank(), legend.margin = ggplot2::margin(c(0, 
+            0, 0, 0), unit = "mm"), legend.justification = "center", 
+        legend.text = ggplot2::element_text(size = base_size, 
+            margin = ggplot2::margin(c(0, 0, 0, 0)), color = rgb(0, 
+                0, 0)), legend.title = ggplot2::element_text(size = base_size, 
+            margin = ggplot2::margin(c(0, 0, 0, 0)), color = rgb(0, 
+                0, 0)), complete = TRUE)
+    ggplot2::`%+replace%`(th1, th2)
+}
+
+
+get_dims <- function(ggobj, height = 8, dpi = 300, units = "in", ...){
+
+  # Adapted from DeLuciatoR::get_dims()
+  
+  maxheight <- height
+  maxwidth <- maxheight * 10
+  
+  tmpf <- tempfile(pattern = "tmp_dim_plot", fileext = ".png")
+  png(filename = tmpf, height = maxheight, width = maxwidth, 
+        units = units, res = dpi)
+    
+    on.exit({
+        dev.off()
+        unlink(tmpf)
+    })
+    
+  g <- ggplotGrob(ggobj)
+    
+  known_ht <- sum(grid::convertHeight(g$heights, units, valueOnly = TRUE))
+  known_wd <- sum(grid::convertWidth(g$widths, units, valueOnly = TRUE))
+  free_ht <- maxheight - known_ht
+
+  null_rowhts <- as.numeric(g$heights[grid::unitType(g$heights) == "null"])
+  null_colwds <- as.numeric(g$widths[grid::unitType(g$widths) == "null"])
+  panel_asps <- (matrix(null_rowhts, ncol = 1) %*% matrix(1/null_colwds, nrow = 1))
+
+  max_rowhts <- free_ht/sum(null_rowhts) * null_rowhts
+  colwds_if_maxht <- max_rowhts[1]/panel_asps[1, ]
+  width <- min(maxwidth, known_wd + sum(colwds_if_maxht))
+    
+  width
+}
+
+
+```
+
+
+
+
+### Metabolomics -------------------------------------------------------------------------------------------------------------
+
+Data
+```{r}
+
+C13mem <- readRDS("../CD8/data/metabolomics/differentiation/C13.rds")
+C13exh <- readRDS("../CD8/data/metabolomics/exhaustion/C13exh_b.rds")
+
+C13mem.cells <- C13mem %>% subset(Sampletype == "cells")
+C13exh.cells <- C13exh %>% subset(Sampletype == "cells")
+
+```
+
+
+Figure 2: MID plots for the metabolic network
+```{r}
+
+if (!dir.exists("results/isoplots2")) dir.create("results/isoplots2")
+s <- 1.8
+
+isoplots_leg <- C13mem %>%
+  subset(Sampletype == "cells") %>%
+  isoplot(title = "name", summarise_by = Celltype, legend = T, cumulative = T, fontsize = 20, labelsize = 40/ggplot2::.pt, size = s, label = FALSE)
+cowplot::get_legend(isoplots_leg$accoa) %>% cowplot::plot_grid() %>%
+  saveplot(dev = "svg", file = "results/isoplots2/iso_legend.svg", width = 800, height = 1200)
+
+isoplots_diff <- C13mem %>%
+  subset(Sampletype == "cells") %>%
+  isoplot(title = "name", summarise_by = Celltype, legend = F, cumulative = T, fontsize = 40, labelsize = 40/ggplot2::.pt, size = s, label = FALSE)
+isoplots_diff <- isoplots_diff[!sapply(isoplots_diff, is.null)]
+isoplots_diff %L>% function(gg) save_isoplot(gg + theme_circles2(), dev = "svg", file = paste0("results/isoplots2/", .name, ".svg"))
+
+metData(C13mem)$name_medium <- paste0(metData(C13mem)$name, " (medium)")
+isoplots_diff_medium <- C13mem %>%
+  subset(Sampletype == "medium" & !is.na(Celltype)) %>%
+  isoplot(title = "name_medium", summarise_by = Celltype, legend = F, cumulative = T, fontsize = 40, labelsize = 40/ggplot2::.pt, size = s, label = FALSE)
+isoplots_diff_medium <- isoplots_diff_medium[!sapply(isoplots_diff_medium, is.null)]
+isoplots_diff_medium %L>% function(gg) save_isoplot(gg + theme_circles2(), dev = "svg", file = paste0("results/isoplots2/", .name, "_medium.svg"))
+
+
+```
+
+
+Figure 3: Volcano plots
+```{r}
+
+nlabels <- 8
+size <- 20
+lab_size <- 12
+conf_tresh <- 1
+lwd = 0.5
+point_size = 2
+max_overlaps = Inf
+r <- 100
+a <- 1
+b <- 0.45
+s <- 50
+
+# Labelling (MID)
+deres <- c13ms::results(C13mem, "iso", "mid", "beta") %L>% subset(., conf > conf_tresh)
+deres <- deres[c("TSCMvsTN_cells", "TCMvsTSCM_cells", "TEMvsTCM_cells")]
+deres <- c(deres, c13ms::results(C13exh, "iso", "mid", "beta")["TEXvsTEFF_cells"])
+names(deres) <- sub("_cells", "", names(deres))
+
+p1 <- deres %L>% ggvolcano(x = diff, title = .name, lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = F, max_overlaps = max_overlaps, repel = r, attract = a,
+                  point_size = point_size, title_size = size, axis_size = size * 0.8, xlim = c(-1,1), ylim = c(0, 20), box.padding = b, seed = s)
+leg <- cowplot::get_legend(p1$TSCMvsTN + theme(legend.title = element_blank()) + 
+                             guides(color = guide_legend(override.aes = list(size = 5))))
+p1 %<L>% function(x) x + theme(plot.margin = ggplot2::unit(c(1,4,1,1) * 0.1, "in"),
+                               legend.position = "none",
+                               plot.tag = element_text(size = size, face = "bold"))
+p1 <- patchwork::wrap_plots(p1, guides = "collect", ncol = 4)
+
+
+# Abundances
+deres <- c13ms::results(C13mem, "met", "norm", "lmm") %L>% subset(., conf > conf_tresh)
+deres <- deres[c("TSCMvsTN_cells", "TCMvsTSCM_cells", "TEMvsTCM_cells")]
+deres <- c(deres, c13ms::results(C13exh, "met", "norm", "lmm")["TEXvsTEFF_cells"])
+names(deres) <- sub("_cells", "", names(deres))
+deres <- lapply(deres, function(x) x[rownames(x) != "myr_d27",] )
+
+p2 <- deres %L>% ggvolcano(title = .name, lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = F, max_overlaps = max_overlaps, repel = 2, attract = 1,
+                  point_size = point_size, title_size = size, axis_size = size * 0.8, xlim = c(-10,10), ylim = c(0, 20), box.padding = 0.2, seed = s)
+p2 %<L>% function(x) x + theme(plot.margin = ggplot2::unit(c(1,4,1,1) * 0.1, "in"),
+                               legend.position = "none",
+                               plot.tag = element_text(size = size, face = "bold"))
+p2 <- patchwork::wrap_plots(p2, guides = "collect", ncol = 4)
+
+p <- patchwork::wrap_plots(p1, p2, guides = "collect", nrow = 2) + patchwork::plot_annotation(tag_levels = "a")
+saveplot(p, file = "results/volcanoplots.svg", dev = "svg", width = 6000, height = 3000)
+cowplot::plot_grid(leg) %>% saveplot(file = "results/volcanoplots_legend.svg", dev = "svg", width = 400, height = 300)
+
+```
+
+
+Figure 4: Seahorse measurements
+```{r}
+
+size <- 20
+
+# # Energy charge
+# anps <- C13mem.cells@metAssays$norm[c("atp", "adp", "amp"),] %>% t() %>% as.data.frame()
+# energydf_mem <- data.frame(colData(C13mem.cells)[rownames(anps),], anps)
+# energydf_mem$Donor <- as.character(energydf_mem$Donor)
+# anps <- C13exh.cells@metAssays$norm[c("atp", "adp", "amp"),] %>% t() %>% as.data.frame()
+# energydf_exh <- data.frame(colData(C13exh.cells)[rownames(anps),], anps)
+# energydf_exh$Donor <- as.character(as.numeric(energydf_exh$Donor) + 3)
+# energydf <- full_join(energydf_mem, energydf_exh)
+# 
+# energydf$ratio <- energydf$atp / energydf$adp
+# 
+# subset(energydf, Celltype %in% c("TN", "TSCM")) %>% t.test(ratio ~ Celltype, data = .)
+# subset(energydf, Celltype %in% c("TEX", "TEFF")) %>% t.test(ratio ~ Celltype, data = .)
+# 
+# ggatp <- datamisc::ggstat(energydf, aes(x = Celltype, y = ratio)) +
+#   theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black"), plot.tag = element_text(size = size, face = "bold")) +
+#   xlab("") + ylab("ATP/ADP")
+
+# ggatp %>% saveplot("results/energy_charge.svg", dev = "svg", width = 2000, height = 1800)
+
+# ggatp <- ggatp + ggpubr::stat_compare_means(comparisons = list(c("TN", "TSCM"), c("TSCM", "TCM"),c("TCM", "TEM"), c("TEFF", "TEX")), paired = T)
+# ggatp
+
+# # Redox charge
+# nads <- C13mem.cells@metAssays$norm[c("nad", "nadh", "nadp", "nadph"),] %>% t() %>% as.data.frame()
+# redox_mem <- data.frame(colData(C13mem.cells)[rownames(nads),], nads)
+# redox_mem$Donor <- as.character(redox_mem$Donor)
+# nads <- C13exh.cells@metAssays$norm[c("nad", "nadh", "nadp", "nadph"),] %>% t() %>% as.data.frame()
+# redox_exh <- data.frame(colData(C13exh.cells)[rownames(nads),], nads)
+# redox_exh$Donor <- as.character(as.numeric(redox_exh$Donor) + 3)
+# redox <- full_join(redox_mem, redox_exh)
+# 
+# redox$ratio_nadh <- redox$nadh / redox$nad
+# redox$ratio_nadph <- redox$nadph / redox$nadp
+# redox$ratio_nadph[is.infinite(redox$ratio_nadph)] <- NA
+# 
+# gg <- datamisc::ggstat(redox, aes(x = Celltype, y = ratio_nadh)) +
+#   theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black")) +
+#   xlab("") + ylab("NADH/NAD")
+# gg %>% saveplot("results/redox_charge.svg", dev = "svg", width = 2000, height = 1800)
+
+
+# Seahorse ECAR/OCR ratios
+seahorse <- read.xlsx("data/Seahorse.xlsx")
+
+seahorse <- subset(seahorse, Celltype != "other")
+seahorse$Donor <- factor(seahorse$Donor)
+seahorse$Day <- factor(seahorse$Day)
+
+seahorse$Celltype <- factor(seahorse$Celltype, ordered = TRUE, levels = c("TN","TSCM","TCM","TEM"))
+
+seahorse$Baseline.Ratio <- seahorse$Baseline.ECAR / seahorse$Baseline.OCR
+seahorse$Stressed.Ratio <- seahorse$Stressed.ECAR / seahorse$Stressed.OCR
+
+ggsea <- ggplot(seahorse, aes(x = Celltype, y = log2(Baseline.Ratio), shape = Donor)) +
+  theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black"), legend.position = "none", plot.tag = element_text(size = size, face = "bold")) +
+  geom_boxplot(aes(x = Celltype, y = log2(Baseline.Ratio), color = Celltype), fill = NA, inherit.aes = F) +
+  geom_jitter(width = 0.1) + 
+  scale_color_manual(values = colors$celltype, guide = "none") +
+  xlab("") +
+  ylab("log2(ECAR/OCR)") + ylim(c(-2,4))
+ggsea <- ggsea + ggpubr::stat_compare_means(comparisons = list(c("TN", "TSCM"), c("TSCM", "TCM"),c("TCM", "TEM")), method = "t.test")
+
+ggsea.ocr <- ggplot(seahorse, aes(x = Celltype, y = Baseline.OCR, shape = Donor)) +
+  theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black"), legend.position = "none", plot.tag = element_text(size = size, face = "bold")) +
+  geom_boxplot(aes(x = Celltype, y = Baseline.OCR, color = Celltype), fill = NA, inherit.aes = F) +
+  geom_jitter(width = 0.1) + 
+  scale_color_manual(values = colors$celltype, guide = "none") +
+  xlab("") +
+  ylab("OCR") + ylim(c(0,2000))
+ggsea.ocr <- ggsea.ocr + ggpubr::stat_compare_means(comparisons = list(c("TN", "TSCM"), c("TSCM", "TCM"),c("TCM", "TEM")), method = "t.test")
+
+ggsea.ecar <- ggplot(seahorse, aes(x = Celltype, y = Baseline.ECAR, shape = Donor)) +
+  theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black"), legend.position = "none", plot.tag = element_text(size = size, face = "bold")) +
+  geom_boxplot(aes(x = Celltype, y = Baseline.ECAR, color = Celltype), fill = NA, inherit.aes = F) +
+  geom_jitter(width = 0.1) + 
+  scale_color_manual(values = colors$celltype, guide = "none") +
+  xlab("") +
+  ylab("ECAR") + ylim(c(0,2500))
+ggsea.ecar <- ggsea.ecar + ggpubr::stat_compare_means(comparisons = list(c("TN", "TSCM"), c("TSCM", "TCM"),c("TCM", "TEM")), method = "t.test")
+
+p <- patchwork::wrap_plots(ggsea.ecar, ggsea.ocr, ggsea, guides = "collect", nrow = 1) + patchwork::plot_annotation(tag_levels = "a")
+saveplot(p, file = "results/seahorse_plots.svg", dev = "svg", width = 4000, height = 1200)
+
+```
+
+
+
+### RNA-seq -------------------------------------------------------------------------------------------------------------
+
+Data
+```{r}
+
+CD8mem <- readRDS("/local drive/data/projects/cd8memory/CD8mem.rds")
+CD8exh <- readRDS("/local drive/data/projects/cd8memory/CD8exh.rds")
+
+degenes <- c(CD8mem$results %>% lapply(., function(x) rownames(subset(x, padj <= 0.01)) ),
+  CD8exh$results %>% lapply(., function(x) rownames(subset(x, padj <= 0.01)) )) %>% unlist() %>% unique()
+
+pmat <- CD8mem$results %>% sapply(., function(x) x[degenes,]$padj ) %>% as.data.frame(row.names = degenes)
+pmat$TEXvsTEFF <- CD8exh$results$TDYSvsTCTRL[degenes,]$padj
+
+dds <- DESeq2::DESeqDataSetFromMatrix(cjoin(CD8mem$txi$counts, CD8exh$txi$counts)[,rownames(rjoin(CD8mem$design, CD8exh$design))],
+                                      colData = rjoin(CD8mem$design, CD8exh$design),
+                                      design = ~ Celltype)
+
+dds <- DESeq2::estimateSizeFactors(dds)
+cd8counts <- counts(dds, normalized = TRUE)
+
+```
+
+
+Figure 5: Heatmap
+```{r}
+
+ndf <- read.xlsx("../CD8/network.xlsx", rowNames = FALSE)
+
+ndf$reaction <- paste0(ndf$from, "-", ndf$to)
+df <- ndf$ids %>% strsplit(x = ., ", ") %>% setNames(., ndf$reaction) %>% stack()
+colnames(df) <- c("gene", "reaction")
+df$pathway <- ndf[match(df$reaction, ndf$reaction),]$pathway
+
+df <- df %>% group_by(gene) %>% summarise(reactions = paste0(reaction, collapse = "_"), pathways = paste0(pathway, collapse = "_")) %>% as.data.frame()
+df <- df[!is.na(df$gene),]
+rownames(df) <- df$gene
+df$pathways[df$pathways == "glycolysis_glycolysis"] <- "glycolysis"
+df$pathways[df$pathways == "amino acids"] <- "amino acid metabolism"
+df$pathways[df$pathways == "TCA"] <- "TCA cycle"
+
+ids <- intersect(rownames(cd8counts), df$gene)
+ids <- ids[ids %in% degenes]
+df <- df[ids,]
+
+tmp <- log2(cd8counts[ids,]+1) %>%
+  summarise_cols(coldata = as.data.frame(colData(dds)), by = Celltype, FUN = rowMeans)
+
+colnames(tmp) <- sub("Tctrl", "TEFF", colnames(tmp))
+colnames(tmp) <- sub("Tdys", "TEX", colnames(tmp))
+
+pw <- unique(df$pathways)
+# subset(paletteer::palettes_d_names, length == length(pw))[,1:2]
+# pcols <- setNames(paletteer::palettes_d$ggsci$signature_substitutions_cosmic, pw)
+pcols <- setNames(c("#59a2de", "#d5d975", "#f5a418", "#554491", "#d42f2f", "#4a9162",
+                    "#63c75b", "#ad75bd", "#635d48", "#4c5a63", "#4a1b27"), pw)
+
+cellmat <- as.data.frame(pmat[rownames(tmp),] <= 0.05)
+colnames(cellmat) <- gsub("vs.*", "", colnames(cellmat))
+cellmat$TN <- F
+cellmat$TEFF <- F
+cellmat <- cellmat[,colnames(tmp)]
+cellFUN <- function(j, i, x, y, width, height, fill) {
+            if (naf(cellmat[i, j] == TRUE)) {
+                grid::grid.points(x, y, pch = 4, gp = grid::gpar(fill = rgb(0,1,0), apha = 0.1), size = unit(5, "pt"))
+            }
+        }
+
+hm <- ComplexHeatmap::Heatmap(matScale(tmp, rows = T), name = "z-scaled expression",  row_split = df$pathways,
+                              column_split = c(rep(1, 4), rep(2, 2)), column_title = NULL,
+                              cluster_columns = F, cluster_rows = TRUE, row_title = NULL,
+                              cell_fun = cellFUN, row_names_gp = grid::gpar(cex = 0.7),
+                              right_annotation = ComplexHeatmap::rowAnnotation(df = df[,"pathways", drop = F], col = list(pathways = pcols)))
+hm %>% saveplot("results/heatmap.svg", dev = "svg", width = 2000, height = 2600)
+
+```
+
+
+Figure 6: GSEA plots
+```{r}
+
+size = 20
+
+HM <- getMSigDb(category = "H")
+names(HM) <- gsub("HALLMARK_", "", names(HM))
+HUMAN1 <- getHUMAN1sets(type = "genes")
+names(HUMAN1) <- gsub("HUMAN1_", "", names(HUMAN1))
+GO <- getMSigDb(category = "C5")
+
+ds2res <- c(CD8mem$results, setNames(CD8exh$results, "TEXvsTEFF"))
+gsea <- ds2res %L>% runfGSEA(data = ., genesets = c(HM, HUMAN1))
+go <- ds2res %L>% runfGSEA(data = ., genesets = GO)
+
+
+ggm <- gsea %L>% ggsea_bar(signif = 0.1, max = 25, title = .name, labsize = 1.4)
+gggo <- go %L>% ggsea_bar(signif = 0.1, max = 25, title = .name, labsize = 1.4)
+leg <- cowplot::get_legend(gggo[[1]])
+ggm <- ggm %L>% function(p){ p + theme(legend.position = "none", plot.tag = element_text(size = size, face = "bold"), plot.title = element_text(size = size),
+                                       plot.margin = ggplot2::unit(c(0.5,0.2,1,0.2)*0.5, "in"))}
+ggm[[4]] <- ggm[[4]] + theme(plot.margin = ggplot2::unit(c(0.5,2,1,0.2)*0.5, "in"))
+p1 <- patchwork::wrap_plots(ggm, guides = "collect", nrow = 1)
+
+gggo <- gggo %L>% function(p){ p + theme(legend.position = "none", plot.tag = element_text(size = size, face = "bold"), plot.title = element_text(size = size),
+                                         plot.margin = ggplot2::unit(c(0.5,0.2,1,0.2)*0.5, "in"))}
+gggo[[4]] <- gggo[[4]] + theme(plot.margin = ggplot2::unit(c(0.5,2,1,0.2)*0.5, "in"))
+p2 <- patchwork::wrap_plots(gggo, guides = "collect", nrow = 1)
+
+p <- patchwork::wrap_plots(p1, p2, guides = "collect", nrow = 2) + patchwork::plot_annotation(tag_levels = "a")
+saveplot(p, "results/gsea.svg", dev = "svg", width = 4000, height = 3000)
+saveplot(cowplot::plot_grid(leg), "results/gsea_legend.svg", dev = "svg", width = 500, height = 600)
+
+```
+
+
+Figure 7: Mitochondrial abundance
+```{r}
+
+mitogenes <- readRDS("data/mitogenes.rds")
+mitogs <- list(abundance = mitogenes$conscor)
+mitogsva <- runGSVA(log2(cd8counts+1), genesets = mitogs)
+
+# mitogsva[1,] %>% ggbar()
+# log2(cd8counts+1)[mitogenes$conscor,] %>% matScale(rows = TRUE) %>% colSums() %>% ggbar()
+
+mitodf <- data.frame(t(mitogsva), colData(dds)[colnames(mitogsva),])
+mitodf$Celltype <- as.character(mitodf$Celltype)
+mitodf$Celltype[mitodf$Celltype == "Tctrl"] <- "TEFF"
+mitodf$Celltype[mitodf$Celltype == "Tdys"] <- "TEX"
+
+mitodf$Celltype <- factor(mitodf$Celltype, ordered = TRUE, levels = c("TN","TSCM","TCM","TEM", "TEFF", "TEX"))
+
+gg <- ggstat(mitodf, aes(x = Celltype, y = abundance)) +
+  theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black")) +
+  xlab("") + ylab("mitochondrial abundance score")
+
+pvec <- list(c("TN", "TSCM"), c("TSCM", "TCM"),c("TCM", "TEM"), c("TEFF", "TEM"), c("TEFF", "TEX")) %S>% function(x){
+  res <- subset(mitodf, Celltype %in% x) %>% t.test(abundance ~ Celltype, data = .)
+  res$p.value
+}
+
+padj <- p.adjust(pvec)
+
+gg <- ggstat(mitodf, mapping = aes(x = Celltype, y = abundance), signif = TRUE, color = Celltype, signif_text = paste0("", as.character(round(padj, 4)))) +
+  theme_gray(base_size = 20) + theme(axis.text = element_text(colour = "black")) +
+  xlab("") + ylab("mitochondrial abundance")
+gg <- gg + scale_color_manual(values = colors$celltype, guide = "none")
+
+
+gg %>% saveplot("results/mitochondria.svg", dev = "svg", width = 2000, height = 1300)
+
+```
+
+
+Mito-pathways
+```{r}
+
+# download.file("ftp://ftp.broadinstitute.org/distribution/metabolic/papers/Pagliarini/MitoCarta3.0/Human.MitoPathways3.0.gmx",
+#               destfile = "data/Human.MitoPathways3.0.gmx")
+# 
+# MP <- sigPathway::importGeneSets("data/Human.MitoPathways3.0.gmx")
+# mpnames <- sapply(MP, function(x) x$src )
+# MP <- lapply(MP, function(x) x$probes )
+# names(MP) <- mpnames
+# 
+# library(fgsea)
+# ds2res <- c(CD8mem$results, setNames(CD8exh$results, "TEXvsTEFF"))
+# 
+# gsea_mp <- ds2res %L>% runfGSEA(data = ., genesets = MP)
+# gsea_mp <- gsea_mp %L>% function(x){ x$group = .name; x}
+# mpdf <- Reduce(rbind, gsea_mp)
+# NESdf <- mpdf %>% tidyr::pivot_wider(id_cols = group, names_from = pathway, values_from = NES)
+# 
+# ggm <- gsea_mp %L>% ggsea_bar(max = 30)
+# ggm[1:3] <- ggm[1:3] %L>% function(p){ p + theme(legend.position = "none")}
+# patchwork::wrap_plots(ggm, guides = "collect", nrow = 1) %>% saveplot("results/gsea_mitocarta.svg", dev = "svg", width = 6000, height = 4000)
+# cxheatmap(NESdf)
+
+```
+
+
